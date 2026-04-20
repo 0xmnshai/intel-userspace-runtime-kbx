@@ -1,69 +1,316 @@
 #include "kbx_io_v4l2.h"
 #include "kbx_types.h"
 
+#include <bits/types/struct_timeval.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <linux/videodev2.h>
+#include <stdio.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/select.h>
 #include <unistd.h>
 
+#define CLEAR(x) memset(&(x), 0, sizeof(x))
+
+static int xioctl(int fh, int request, void *arg) {
+  int r;
+
+  do {
+    r = ioctl(fh, request, arg);
+  } while (-1 == r && EINTR == errno);
+
+  return r;
+}
+
+const char *extension = "raw";
+
+static void save_frame(const char *path, const void *p, int size) {
+  int fd, rz;
+
+  fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+  if (fd < 0)
+    perror("open");
+  else {
+    rz = write(fd, p, size);
+    printf("Wrote %d of %d bytes to %s\n", rz, size, path);
+    close(fd);
+  }
+}
+
 kbx_status_t kbx_v4l2_init(kbx_v4l2_device *device,
-                           const kbx_v4l2_init_params *params) {
-  int ret;
-  struct v4l2_capability cap;
-  struct v4l2_format fmt;
+                           const kbx_v4l2_init_params_t *params) {
+  unsigned int n_buffers;
+  kbx_buffer *buffers;
 
-  device->fd = open(params->device_name, O_RDWR | O_NONBLOCK);
-  if (device->fd < 0) {
+  kbx_camera_device camera;
+  v4l2_std_id std_id = V4L2_STD_UNKNOWN;
+
+  camera.fd = open(params->device_name, O_RDWR | O_NONBLOCK);
+  if (-1 == camera.fd) {
+    fprintf(stderr, "Cannot open '%s': %d, %s\n", params->device_name, errno,
+            strerror(errno));
     return KBX_STATUS_ERR_IO;
   }
 
-  ret = ioctl(device->fd, VIDIOC_QUERYCAP, &cap);
-  if (ret < 0) {
+  if (-1 == xioctl(camera.fd, VIDIOC_QUERYCAP, &camera.capability)) {
+    if (errno == EINVAL) {
+      fprintf(stderr, "%s is no V4L2 device\n", params->device_name);
+      return KBX_STATUS_ERR_IO;
+    } else {
+      fprintf(stderr, "VIDIOC_QUERYCAP error %d, %s\n", errno, strerror(errno));
+      return KBX_STATUS_ERR_IO;
+    }
+  }
+
+  if (!(camera.capability.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+    fprintf(stderr, "%s is no video capture device\n", params->device_name);
+    return KBX_STATUS_ERR_IO;
+  }
+  if (!(camera.capability.capabilities & V4L2_CAP_STREAMING)) {
+    fprintf(stderr, "%s does not support streaming i/o\n", params->device_name);
     return KBX_STATUS_ERR_IO;
   }
 
-  if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+  if (!(camera.capability.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
     return KBX_STATUS_ERR_IO;
   }
 
-  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  fmt.fmt.pix.width = params->width;
-  fmt.fmt.pix.height = params->height;
-  fmt.fmt.pix.pixelformat = params->format;
-  fmt.fmt.pix.field = V4L2_FIELD_ANY;
-  ret = ioctl(device->fd, VIDIOC_S_FMT, &fmt);
+  /* get standard (only if it has a tuner/analog support) */
+  if (camera.capability.capabilities &
+      (V4L2_CAP_TUNER | V4L2_CAP_VBI_CAPTURE)) {
+    if (-1 == xioctl(camera.fd, VIDIOC_G_STD, &std_id))
+      perror("VIDIOC_G_STD");
+    for (int i = 0; std_id == V4L2_STD_ALL && i < 10; i++) {
+      usleep(100000);
+      xioctl(camera.fd, VIDIOC_G_STD, &std_id);
+    }
 
-  if (ret < 0) {
+    /* set the standard to the detected standard */
+    if (std_id != V4L2_STD_UNKNOWN) {
+      if (-1 == xioctl(camera.fd, VIDIOC_S_STD, &std_id))
+        perror("VIDIOC_S_STD");
+      if (std_id & V4L2_STD_NTSC)
+        printf("found NTSC TV decoder\n");
+      if (std_id & V4L2_STD_SECAM)
+        printf("found SECAM TV decoder\n");
+      if (std_id & V4L2_STD_PAL)
+        printf("found PAL TV decoder\n");
+    }
+  }
+
+  /* set video input */
+  CLEAR(camera.input);
+  camera.input.index = 0;
+
+  /* set framerate */
+  CLEAR(camera.streamparm);
+  camera.streamparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (-1 == xioctl(camera.fd, VIDIOC_S_PARM, &camera.streamparm))
+    perror("VIDIOC_S_PARM");
+
+  /* get framerate */
+  CLEAR(camera.streamparm);
+  camera.streamparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (-1 == xioctl(camera.fd, VIDIOC_G_PARM, &camera.streamparm))
+    perror("VIDIOC_G_PARM");
+
+  /* set format */
+  CLEAR(camera.format);
+  camera.format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  camera.format.fmt.pix.width = params->width;
+  camera.format.fmt.pix.height = params->height;
+  camera.format.fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
+  camera.format.fmt.pix.field = V4L2_FIELD_ANY;
+  if (-1 == xioctl(camera.fd, VIDIOC_S_FMT, &camera.format)) {
+    fprintf(stderr, "VIDIOC_S_FMT error %d, %s\n", errno, strerror(errno));
     return KBX_STATUS_ERR_IO;
   }
 
-  struct v4l2_requestbuffers req;
-  req.count = 4;
-  req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  req.memory = V4L2_MEMORY_DMABUF;
-  ret = ioctl(device->fd, VIDIOC_REQBUFS, &req);
-  if (ret < 0) {
+  /* get and display format */
+  CLEAR(camera.format);
+  camera.format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (-1 == xioctl(camera.fd, VIDIOC_G_FMT, &camera.format)) {
+    fprintf(stderr, "VIDIOC_G_FMT error %d, %s\n", errno, strerror(errno));
     return KBX_STATUS_ERR_IO;
   }
 
-  struct v4l2_buffer buf;
-  buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  buf.memory = V4L2_MEMORY_DMABUF;
-  buf.index = 0;
-  ret = ioctl(device->fd, VIDIOC_QUERYBUF, &buf);
-  if (ret < 0) {
+  if (camera.format.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG) {
+    extension = "jpg";
+  } else {
+    extension = "raw";
+  }
+
+  printf("%s: %dx%d %c%c%c%c %2.2ffps\n", params->device_name,
+         camera.format.fmt.pix.width, camera.format.fmt.pix.height,
+         (camera.format.fmt.pix.pixelformat >> 0) & 0xff,
+         (camera.format.fmt.pix.pixelformat >> 8) & 0xff,
+         (camera.format.fmt.pix.pixelformat >> 16) & 0xff,
+         (camera.format.fmt.pix.pixelformat >> 24) & 0xff,
+         camera.streamparm.parm.capture.timeperframe.numerator
+             ? (float)camera.streamparm.parm.capture.timeperframe.denominator /
+                   (float)camera.streamparm.parm.capture.timeperframe.numerator
+             : 0);
+
+  /* request buffers */
+  CLEAR(camera.requestbuffers);
+  camera.requestbuffers.count = 4;
+  camera.requestbuffers.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  camera.requestbuffers.memory = V4L2_MEMORY_MMAP;
+
+  if (-1 == xioctl(camera.fd, VIDIOC_REQBUFS, &camera.requestbuffers)) {
+    if (EINVAL == errno) {
+      fprintf(stderr, "%s does not support memory mapping\n",
+              params->device_name);
+      return KBX_STATUS_ERR_IO;
+    } else {
+      fprintf(stderr, "VIDIOC_REQBUFS error %d, %s\n", errno, strerror(errno));
+      return KBX_STATUS_ERR_IO;
+    }
+  }
+  if (camera.requestbuffers.count < 2) {
+    fprintf(stderr, "Insufficient buffer memory on %s\n", params->device_name);
+    exit(EXIT_FAILURE);
+  }
+
+  /* allocate buffers */
+  buffers = (kbx_buffer *)calloc(camera.requestbuffers.count, sizeof(*buffers));
+  if (!buffers) {
+    fprintf(stderr, "Out of memory\n");
+    return KBX_STATUS_ERR_NOMEM;
+  }
+
+  /* mmap buffers */
+  for (n_buffers = 0; n_buffers < camera.requestbuffers.count; ++n_buffers) {
+    struct v4l2_buffer buffer_info;
+
+    CLEAR(buffer_info);
+
+    buffer_info.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buffer_info.memory = V4L2_MEMORY_MMAP;
+    buffer_info.index = n_buffers;
+
+    if (-1 == xioctl(camera.fd, VIDIOC_QUERYBUF, &buffer_info))
+      printf("VIDIOC_QUERYBUF error %d, %s\n", errno, strerror(errno));
+
+    buffers[n_buffers].length = buffer_info.length;
+    buffers[n_buffers].start =
+        mmap(NULL /* start anywhere */, buffer_info.length,
+             PROT_READ | PROT_WRITE /* required */,
+             MAP_SHARED /* recommended */, camera.fd, buffer_info.m.offset);
+
+    if (MAP_FAILED == buffers[n_buffers].start) {
+      printf("mmap error %d, %s\n", errno, strerror(errno));
+      return KBX_STATUS_ERR_IO;
+    } else
+      printf("mmap success\n");
+  }
+
+  /* queue buffers */
+  for (unsigned int i = 0; i < n_buffers; ++i) {
+    struct v4l2_buffer buffer_info;
+
+    CLEAR(buffer_info);
+    buffer_info.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buffer_info.memory = V4L2_MEMORY_MMAP;
+    buffer_info.index = i;
+
+    if (-1 == xioctl(camera.fd, VIDIOC_QBUF, &buffer_info)) {
+      printf("VIDIOC_QBUF error %d, %s\n", errno, strerror(errno));
+      return KBX_STATUS_ERR_IO;
+    } else
+      printf("VIDIOC_QBUF success\n");
+  }
+
+  device->fd = camera.fd;
+  device->buffers = buffers;
+  device->n_buffers = n_buffers;
+  return KBX_STATUS_SUCCESS;
+}
+
+kbx_status_t kbx_v4l2_start_capture(kbx_v4l2_device *device,
+                                    kbx_v4l2_init_params_t *params) {
+  enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  kbx_buffer *buffers = device->buffers;
+  char filename[32];
+  uint32_t count = params->frame_count;
+
+  if (-1 == xioctl(device->fd, VIDIOC_STREAMON, &type)) {
+    printf("VIDIOC_STREAMON error %d, %s\n", errno, strerror(errno));
     return KBX_STATUS_ERR_IO;
   }
 
-  ret = ioctl(device->fd, VIDIOC_G_FMT, &fmt);
-  if (ret < 0) {
-    return KBX_STATUS_ERR_IO;
+  // If count is 0, we loop indefinitely. If count > 0, we capture 'count' frames.
+  for (unsigned int i = 0; (count == 0) || (i < count); i++) {
+    for (;;) {
+      fd_set fds;
+      struct timeval time_val;
+      int r;
+
+      FD_ZERO(&fds);
+      FD_SET(device->fd, &fds);
+
+      time_val.tv_sec = 2;
+      time_val.tv_usec = 0;
+
+      r = select(device->fd + 1, &fds, NULL, NULL, &time_val);
+      if (-1 == r) {
+        if (EINTR == errno)
+          continue;
+        return KBX_STATUS_ERR_IO;
+      }
+      if (0 == r) {
+        fprintf(stderr, "Timeout waiting for frame\n");
+        return KBX_STATUS_ERR_IO;
+      }
+
+      struct v4l2_buffer buffer_info;
+      CLEAR(buffer_info);
+      buffer_info.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buffer_info.memory = V4L2_MEMORY_MMAP;
+
+      if (-1 == xioctl(device->fd, VIDIOC_DQBUF, &buffer_info)) {
+        if (errno == EAGAIN)
+          continue;
+        printf("VIDIOC_DQBUF error %d, %s\n", errno, strerror(errno));
+        return KBX_STATUS_ERR_IO;
+      }
+
+      printf("Captured frame %d, size: %d bytes\n", i + 1, buffer_info.bytesused);
+
+      sprintf(filename, "frame%d.%s", i + 1, extension);
+      save_frame(filename, buffers[buffer_info.index].start, buffer_info.bytesused);
+
+      /* re-queue buffer */
+      if (-1 == xioctl(device->fd, VIDIOC_QBUF, &buffer_info)) {
+        printf("VIDIOC_QBUF error %d, %s\n", errno, strerror(errno));
+        return KBX_STATUS_ERR_IO;
+      }
+      break;
+    }
   }
 
   return KBX_STATUS_SUCCESS;
 }
 
-void kbx_v4l2_destroy(kbx_v4l2_device *device) { close(device->fd); }
+
+void kbx_v4l2_destroy(kbx_v4l2_device *device) {
+  if (device->buffers) {
+    for (unsigned int i = 0; i < device->n_buffers; ++i) {
+      munmap(device->buffers[i].start, device->buffers[i].length);
+    }
+    free(device->buffers);
+    device->buffers = NULL;
+  }
+  if (device->fd >= 0) {
+    close(device->fd);
+    device->fd = -1;
+  }
+}
+
 
 kbx_status_t kbx_v4l2_get_dmabuf(kbx_v4l2_device *device, int *fd) {
   struct v4l2_exportbuffer exp_buf;

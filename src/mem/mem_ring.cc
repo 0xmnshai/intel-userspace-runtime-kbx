@@ -7,13 +7,13 @@ kbx_status_t kbx_ring_init(kbx_task_queue *ring, size_t size) {
       (kbx_task_params *)numa_alloc_onnode(sizeof(kbx_task_params) * size, 0);
 
   if (ring->tasks == NULL) {
-    return KBX_STATUS_ERR_NO_MEM;
+    return KBX_STATUS_ERR_NOMEM;
   }
 
   ring->data = (void **)numa_alloc_onnode(sizeof(void *) * size, 0);
 
   if (ring->data == NULL) {
-    return KBX_STATUS_ERR_NO_MEM;
+    return KBX_STATUS_ERR_NOMEM;
   }
 
   ring->size = size;

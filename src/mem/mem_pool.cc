@@ -13,7 +13,7 @@ kbx_status_t kbx_mem_pool_init(kbx_mem_manager *mem_manager, size_t size) {
       sizeof(kbx_mem_pool) * pool_count, node);
 
   if (mem_manager->cpu_pool == NULL) {
-    return KBX_STATUS_ERR_NO_MEM;
+    return KBX_STATUS_ERR_NOMEM;
   }
 
   mem_manager->cpu_pool->size = pool_count;
@@ -21,7 +21,7 @@ kbx_status_t kbx_mem_pool_init(kbx_mem_manager *mem_manager, size_t size) {
   for (size_t i = 0; i < pool_count; i++) {
     mem_manager->cpu_pool[i].buf = numa_alloc_onnode(bytes, node);
     if (mem_manager->cpu_pool[i].buf == NULL) {
-      return KBX_STATUS_ERR_NO_MEM;
+      return KBX_STATUS_ERR_NOMEM;
     }
     mem_manager->cpu_pool[i].size = pool_count;
     mem_manager->cpu_pool[i].used = 0;
@@ -30,7 +30,7 @@ kbx_status_t kbx_mem_pool_init(kbx_mem_manager *mem_manager, size_t size) {
     mem_manager->cpu_pool[i].blocks = (kbx_mem_block *)numa_alloc_onnode(
         sizeof(kbx_mem_block) * (bytes / 4096), node);
     if (mem_manager->cpu_pool[i].blocks == NULL) {
-      return KBX_STATUS_ERR_NO_MEM;
+      return KBX_STATUS_ERR_NOMEM;
     }
     for (size_t j = 0; j < (bytes / 4096); j++) {
       mem_manager->cpu_pool[i].blocks[j].size = 4096;

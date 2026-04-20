@@ -799,3 +799,23 @@ int main() {
 
 
 http://events17.linuxfoundation.org/sites/events/files/slides/v4l2-frameworks_0.pdf
+
+
+how to stream webcam from mac to server :
+
+mac: 
+ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0" \
+       -f mjpeg -listen 1 http://0.0.0.0:8080
+
+
+server:
+to test image capture :
+    ffmpeg -f v4l2 -i /dev/video0 -frames 1 test.jpg
+
+
+create virutal cam:
+    sudo modprobe v4l2loopback devices=1 video_nr=0 card_label="VirtualCam" exclusive_caps=1
+    to see if it's created :ls /dev/video* &&  v4l2-ctl --list-devices
+    
+to stream :
+    ffmpeg -i http://192.168.64.1:8080 -f v4l2 -pix_fmt yuv420p /dev/video0

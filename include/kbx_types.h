@@ -57,7 +57,7 @@ typedef enum {
 
 typedef enum {
   KBX_STATUS_SUCCESS = 0,
-  KBX_STATUS_ERR_NO_MEM = -1,
+  KBX_STATUS_ERR_NOMEM = -1,
   KBX_STATUS_ERR_IO = -2,
   KBX_STATUS_ERR_GPU = -3,
   KBX_STATUS_ERR_DRM = -4,
